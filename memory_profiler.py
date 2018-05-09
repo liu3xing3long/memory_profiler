@@ -189,6 +189,90 @@ def _get_memory(pid, backend, timestamps=False, include_children=False, filename
     return tools[backend]()
 
 
+def get_gpu_memory_compute_app():
+        # get all compute app memory map, mapped by process pid
+        result = subprocess.check_output(
+            [
+                'nvidia-smi', '--query-compute-apps=pid,used_memory',
+                '--format=csv,nounits,noheader'
+            ])
+        gpu_memory_map = {}
+        if result != "":
+            # Convert lines into a dictionary
+            for x in result.strip().split('\n'):
+                pid, mem = x.split(",")
+                gpu_memory_map[int(pid)] = int(mem)
+
+        return gpu_memory_map
+
+
+def get_used_gpu_memory_map():
+        # get all used gpu map, mapped by device id
+        result = subprocess.check_output(
+            [
+                'nvidia-smi', '--query-gpu=memory.used',
+                '--format=csv,nounits,noheader'
+            ])
+        # Convert lines into a dictionary
+        gpu_memory = [int(x) for x in result.strip().split('\n')]
+        gpu_memory_map = dict(zip(range(len(gpu_memory)), gpu_memory))
+        return gpu_memory_map
+
+
+def _get_child_gpu_memory(parent_pid, meminfo_attr=None):
+    """
+    Returns a generator that yields memory for all child processes.
+    """
+    # Convert a pid to a process
+    if isinstance(parent_pid, int):
+        if parent_pid == -1: 
+            parent_pid = os.getpid()
+        process = psutil.Process(parent_pid)
+
+    # if not meminfo_attr:
+        # Use the psutil 2.0 attr if the older version isn't passed in.
+        # meminfo_attr = 'memory_info' if hasattr(process, 'memory_info') else 'get_memory_info'
+
+    # Select the psutil function get the children similar to how we selected
+    # the memory_info attr (a change from excepting the AttributeError).
+    children_attr = 'children' if hasattr(process, 'children') else 'get_children'
+
+    # Loop over the child processes and yield their memory
+    mem_used = 0
+    try:
+        for child in getattr(process, children_attr)(recursive=True):
+            # yield getattr(child, meminfo_attr)()[0] / _TWO_20
+            child_pid = child.pid
+            gpu_memory_map = get_gpu_memory_compute_app()
+
+            if gpu_memory_map.has_key(child_pid):
+                mem_used = gpu_memory_map[child_pid]
+                yield mem_used
+            
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        # https://github.com/fabianp/memory_profiler/issues/71
+        yield 0.0
+
+
+def _get_gpu_memory(pid, backend, timestamps=False, include_children=False, filename=None):
+    # .. low function to get memory consumption ..
+    if pid == -1:
+        pid = os.getpid()
+
+    gpu_memory_map = get_gpu_memory_compute_app()
+    mem_used = 0
+
+    if gpu_memory_map.has_key(pid):
+        mem_used = gpu_memory_map[pid]
+
+    if include_children:
+        mem_used +=  sum(_get_child_gpu_memory(pid))
+
+    if timestamps:
+        return mem_used, time.time()
+    else:
+        return mem_used
+
 class MemTimer(Process):
     """
     Fetch memory consumption from over a time interval
@@ -419,6 +503,202 @@ def memory_usage(proc=-1, interval=.1, timeout=None, timestamps=False,
             else:
                 ret = max([ret,
                            _get_memory(proc, backend, include_children=include_children)
+                           ])
+
+            time.sleep(interval)
+            # Flush every 50 lines.
+            if counter % 50 == 0 and stream is not None:
+                stream.flush()
+    if stream:
+        return None
+    return ret
+
+
+def gpu_memory_usage(proc=-1, interval=.1, timeout=None, timestamps=False,
+                 include_children=False, multiprocess=False, max_usage=False,
+                 retval=False, stream=None, backend=None):
+    """
+    Return the memory usage of a process or piece of code
+
+    Parameters
+    ----------
+    proc : {int, string, tuple, subprocess.Popen}, optional
+        The process to monitor. Can be given by an integer/string
+        representing a PID, by a Popen object or by a tuple
+        representing a Python function. The tuple contains three
+        values (f, args, kw) and specifies to run the function
+        f(*args, **kw).
+        Set to -1 (default) for current process.
+
+    interval : float, optional
+        Interval at which measurements are collected.
+
+    timeout : float, optional
+        Maximum amount of time (in seconds) to wait before returning.
+
+    max_usage : bool, optional
+        Only return the maximum memory usage (default False)
+
+    retval : bool, optional
+        For profiling python functions. Save the return value of the profiled
+        function. Return value of memory_usage becomes a tuple:
+        (mem_usage, retval)
+
+    timestamps : bool, optional
+        if True, timestamps of memory usage measurement are collected as well.
+
+    include_children : bool, optional
+        if True, sum the memory of all forked processes as well
+
+    multiprocess : bool, optional
+        if True, track the memory usage of all forked processes.
+
+    stream : File
+        if stream is a File opened with write access, then results are written
+        to this file instead of stored in memory and returned at the end of
+        the subprocess. Useful for long-running processes.
+        Implies timestamps=True.
+
+    Returns
+    -------
+    mem_usage : list of floating-point values
+        memory usage, in MiB. It's length is always < timeout / interval
+        if max_usage is given, returns the two elements maximum memory and
+        number of measurements effectuated
+    ret : return value of the profiled function
+        Only returned if retval is set to True
+    """
+    backend = choose_backend(backend)
+    if stream is not None:
+        timestamps = True
+
+    if not max_usage:
+        ret = []
+    else:
+        ret = -1
+
+    if timeout is not None:
+        max_iter = int(timeout / interval)
+    elif isinstance(proc, int):
+        # external process and no timeout
+        max_iter = 1
+    else:
+        # for a Python function wait until it finishes
+        max_iter = float('inf')
+
+    if callable(proc):
+        proc = (proc, (), {})
+    if isinstance(proc, (list, tuple)):
+        if len(proc) == 1:
+            f, args, kw = (proc[0], (), {})
+        elif len(proc) == 2:
+            f, args, kw = (proc[0], proc[1], {})
+        elif len(proc) == 3:
+            f, args, kw = (proc[0], proc[1], proc[2])
+        else:
+            raise ValueError
+
+        while True:
+            child_conn, parent_conn = Pipe()  # this will store MemTimer's results
+            p = MemTimer(os.getpid(), interval, child_conn, backend,
+                         timestamps=timestamps,
+                         max_usage=max_usage,
+                         include_children=include_children)
+            p.start()
+            parent_conn.recv()  # wait until we start getting memory
+
+            # When there is an exception in the "proc" - the (spawned) monitoring processes don't get killed.
+            # Therefore, the whole process hangs indefinitely. Here, we are ensuring that the process gets killed!
+            try:
+                returned = f(*args, **kw)
+                parent_conn.send(0)  # finish timing
+                ret = parent_conn.recv()
+                n_measurements = parent_conn.recv()
+                if retval:
+                    ret = ret, returned
+            except Exception:
+                parent = psutil.Process(os.getpid())
+                for child in parent.children(recursive=True):
+                    os.kill(child.pid, SIGKILL)
+                p.join(0)
+                raise
+
+            p.join(5 * interval)
+            if n_measurements > 4 or interval < 1e-6:
+                break
+            interval /= 10.
+    elif isinstance(proc, subprocess.Popen):
+        # external process, launched from Python
+        line_count = 0
+        while True:
+            if not max_usage:
+                mem_usage = _get_gpu_memory(
+                    proc.pid, backend, timestamps=timestamps,
+                    include_children=include_children)
+
+                if stream is not None:
+                    stream.write("MEM {0:.6f} {1:.4f}\n".format(*mem_usage))
+
+                    # Write children to the stream file
+                    if multiprocess:
+                        for idx, chldmem in enumerate(_get_child_memory(proc.pid)):
+                            stream.write("CHLD {0} {1:.6f} {2:.4f}\n".format(idx, chldmem, time.time()))
+                else:
+                    # Create a nested list with the child memory
+                    if multiprocess:
+                        mem_usage = [mem_usage]
+                        for chldmem in _get_child_memory(proc.pid):
+                            mem_usage.append(chldmem)
+
+                    # Append the memory usage to the return value
+                    ret.append(mem_usage)
+            else:
+                ret = max(ret,
+                          _get_gpu_memory(
+                              proc.pid, backend, include_children=include_children))
+            time.sleep(interval)
+            line_count += 1
+            # flush every 50 lines. Make 'tail -f' usable on profile file
+            if line_count > 50:
+                line_count = 0
+                if stream is not None:
+                    stream.flush()
+            if timeout is not None:
+                max_iter -= 1
+                if max_iter == 0:
+                    break
+            if proc.poll() is not None:
+                break
+    else:
+        # external process
+        if max_iter == -1:
+            max_iter = 1
+        counter = 0
+        while counter < max_iter:
+            counter += 1
+            if not max_usage:
+                mem_usage = _get_gpu_memory(
+                    proc, backend, timestamps=timestamps,
+                    include_children=include_children)
+                if stream is not None:
+                    stream.write("MEM {0:.6f} {1:.4f}\n".format(*mem_usage))
+
+                    # Write children to the stream file
+                    if multiprocess:
+                        for idx, chldmem in enumerate(_get_child_memory(proc)):
+                            stream.write("CHLD {0} {1:.6f} {2:.4f}\n".format(idx, chldmem, time.time()))
+                else:
+                    # Create a nested list with the child memory
+                    if multiprocess:
+                        mem_usage = [mem_usage]
+                        for chldmem in _get_child_memory(proc):
+                            mem_usage.append(chldmem)
+
+                    # Append the memory usage to the return value
+                    ret.append(mem_usage)
+            else:
+                ret = max([ret,
+                           _get_gpu_memory(proc, backend, include_children=include_children)
                            ])
 
             time.sleep(interval)

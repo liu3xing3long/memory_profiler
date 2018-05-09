@@ -198,6 +198,9 @@ This file contains the process memory consumption, in Mb (one value per line).""
                              'Option 3: (--python flag present) "<PYTHON_EXECUTABLE> <PYTHON_SCRIPT> <ARG1> <ARG2>..." - profile python script with specified interpreter\n'
                              'Option 4: (--python flag present) "<PYTHON_MODULE> <ARG1> <ARG2>..." - profile python module\n'
                         )
+    ## adding support for gpu mem profile
+    parser.add_argument("--gpu", "-g", dest="gpu", action="store_true", default=False, help="""profile gpu mem usage""")
+
     args = parser.parse_args()
 
     if len(args.program) == 0:
@@ -206,6 +209,7 @@ This file contains the process memory consumption, in Mb (one value per line).""
 
     print("{1}: Sampling memory every {0}s".format(
         args.interval, osp.basename(sys.argv[0])))
+    print("collecting {} usage information".format("GPU" if args.gpu else "CPU"))
 
     mprofile_output = args.filename
 
@@ -234,7 +238,12 @@ This file contains the process memory consumption, in Mb (one value per line).""
 
     with open(mprofile_output, "a") as f:
         f.write("CMDLINE {0}\n".format(cmd_line))
-        mp.memory_usage(proc=p, interval=args.interval, timestamps=True,
+        if args.gpu:
+            mp.gpu_memory_usage(proc=p, interval=args.interval, timestamps=True,
+                        include_children=args.include_children,
+                        multiprocess=args.multiprocess, stream=f)
+        else:
+            mp.memory_usage(proc=p, interval=args.interval, timestamps=True,
                         include_children=args.include_children,
                         multiprocess=args.multiprocess, stream=f)
 
